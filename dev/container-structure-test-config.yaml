@@ -1,0 +1,35 @@
+schemaVersion: '2.0.0'
+
+metadataTest:
+  env:
+    - key: PATH
+      value: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  entrypoint: []
+  cmd: ["bash"]
+  exposedPorts: []
+  volumes: []
+
+fileExistenceTests:
+  - name: 'FILE check docker-disable-recommends exists'
+    path: '/etc/apt/apt.conf.d/docker-disable-recommends'
+    shouldExist: true
+    permissions: '-rw-r--r--'
+    uid: 0
+    gid: 0
+  - name: 'check /usr/share/man/man1 exists'
+    path: '/usr/share/man/man1'
+    shouldExist: true
+    permissions: 'drwxr-xr-x'
+    uid: 0
+    gid: 0
+  - name: 'check /usr/share/man/man7 exists'
+    path: '/usr/share/man/man1'
+    shouldExist: true
+    permissions: 'drwxr-xr-x'
+    uid: 0
+    gid: 0
+    
+fileContentTests:
+  - name: 'APT disable install recommends'
+    expectedContents: ['APT::Install-Recommends "false";']
+    path: '/etc/apt/apt.conf.d/docker-disable-recommends'

@@ -1,0 +1,161 @@
+variables:
+  GIT_DEPTH: "1"
+  DOCKER_HOST: tcp://localhost:2375
+  DOCKER_DRIVER: overlay2
+
+# define global before_script as string
+# please delimit each command with an comma
+.before_script_default: &before_script_defaults |
+  export CI_COMMIT_SHA_SHORT=${CI_COMMIT_SHA:0:8};
+  export IMAGE_RELEASE_TAG=${CI_COMMIT_TAG:=latest};
+  export IMAGE_RELEASE_NAME=${IMAGE_RELEASE_NAME:=${CI_PROJECT_NAME}};
+
+# define global before_script_docker_auth as string
+# please delimit each command with an comma
+.before_script_docker_auth: &before_script_docker_auth |
+  if [[ ! -z "${AWS_ECR_REPOSITORY_URL}" ]] && [[ ! -z "${AWS_ACCESS_KEY_ID}" ]] && [[ ! -z "${AWS_SECRET_ACCESS_KEY}" ]] && [[ ! -z "${AWS_DEFAULT_REGION}" ]] && [[ ! -z "${AWS_ACCOUNT_ID}" ]]; then
+    eval $(aws ecr get-login --no-include-email --region "${AWS_DEFAULT_REGION}" --registry-ids "${AWS_ACCOUNT_ID}");
+  fi
+  if [[ ! -z "${DOCKERHUB_REGISTRY_ORGANISATION}" ]] && [[ ! -z "${DOCKERHUB_REGISTRY_USER}" ]] && [[ ! -z "${DOCKERHUB_REGISTRY_PASSWORD}" ]]; then
+    docker login -u "${DOCKERHUB_REGISTRY_USER}" -p "${DOCKERHUB_REGISTRY_PASSWORD}" docker.io
+  fi
+  if [[ ! -z "${GITLAB_REPOSITORY_URL}" ]] && [[ ! -z "${CI_REGISTRY}" ]]; then
+    docker login -u gitlab-ci-token -p "${CI_BUILD_TOKEN}" "${CI_REGISTRY}"
+  fi
+
+stages:
+  - preflight
+  - build
+  - test
+  - release
+
+## Generic preflight template
+.preflight: &preflight
+  stage: preflight
+  allow_failure: true
+  tags:
+    - kubernetes-runner
+  only:
+    - branches
+    - /(?<=master).*/
+  except:
+    - schedules
+    - /^master$/
+    - /^v\d+\.\d+\.\d+(?:-(?:beta|rc)(?:(?:(?:\+|\.)?[a-zA-Z0-9]+)*)?)?$/
+  artifacts:
+    reports:
+      junit: src/*/junit-*-report.xml
+
+
+###############################
+## preflight jobs
+###############################
+hadolint:
+  image: ${CI_IMAGE_HADONLINT}
+  <<: *preflight
+  before_script:
+    - *before_script_defaults
+    - hadolint --version
+  after_script:
+    - for file in $(find src -type f -name "hadolint.json" -print | xargs --max-lines=1); do gitlab-helper convert hadolint -i $file -o "$( dirname "${file}" )/junit-hadolint-report.xml" -d "$( dirname "${file}" )/Dockerfile"; done
+  script:
+    - |
+      for file in $(find src -type f -name "Dockerfile" -print | xargs --max-lines=1); do
+        if !  hadolint -f json $file > "$( dirname "${file}" )/hadolint.json"; then
+          export FAILED=1
+        fi
+      done
+      if [ "${FAILED}" = "1" ]; then
+        exit 1
+      fi
+
+shellcheck:
+  image: ${CI_IMAGE_SHELLCHECK}
+  <<: *preflight
+  before_script:
+    - *before_script_defaults
+    - shellcheck --version
+  after_script:
+    - for file in $(find src -type f -name "shellcheck.json" -print | xargs --max-lines=1); do gitlab-helper convert shellcheck -i $file -o "$( dirname "${file}" )/junit-shellcheck-report.xml" -d "${file}"; done
+  script:
+    - |
+      for file in $(find src -type f -exec grep -IRl '#\!\(/usr/bin/env \|/bin/\)' {} \; | xargs --max-lines=1); do
+        if !  shellcheck -f json $file > "$( dirname "${file}" )/shellcheck.json"; then
+          export FAILED=1
+        fi
+      done
+      if [ "${FAILED}" = "1" ]; then
+        exit 1
+      fi
+
+###############################
+## build jobs
+###############################
+build:
+  stage: build
+  tags:
+    - kubernetes-runner
+  artifacts:
+    paths:
+      - build
+    expire_in: 2 days
+    when: on_success
+  services:
+    - name: docker:dind
+      command: ["dockerd", "--host=tcp://0.0.0.0:2375"]
+  before_script:
+    - mkdir build
+  script:
+    - docker build --pull --force-rm -t ${CI_PROJECT_NAME}:build src/
+    - docker save -o build/${CI_PROJECT_NAME}.tar ${CI_PROJECT_NAME}:build
+
+##############################
+# release jobs
+##############################
+release:
+  stage: release
+  tags:
+    - kubernetes-runner
+  only:
+    refs:
+      - /^master$/
+      - /^v?\d+\.\d+\.\d+(?:-(?:beta|rc|dev|alpha|RC|p)(?:(?:(?:\+|\.)?[a-zA-Z0-9]+)*)?)?$/
+      - schedules
+  services:
+    - name: docker:dind
+      command: ["dockerd", "--host=tcp://0.0.0.0:2375"]
+  before_script:
+    - *before_script_defaults
+    - *before_script_docker_auth
+    - docker load -i build/${CI_PROJECT_NAME}.tar
+  script:
+    - if [[ ! -z "${AWS_ECR_REPOSITORY_URL}" ]] && [[ ! -z "${AWS_ACCESS_KEY_ID}" ]] && [[ ! -z "${AWS_SECRET_ACCESS_KEY}" ]] && [[ ! -z "${AWS_DEFAULT_REGION}" ]] && [[ ! -z "${AWS_ACCOUNT_ID}" ]]; then
+    -   docker tag "${CI_PROJECT_NAME}:build" "${AWS_ECR_REPOSITORY_URL}/${IMAGE_RELEASE_NAME}:${IMAGE_RELEASE_TAG}";
+    -   docker push "${AWS_ECR_REPOSITORY_URL}/${IMAGE_RELEASE_NAME}:${IMAGE_RELEASE_TAG}";
+    - fi
+    - if [[ ! -z "${GITLAB_REPOSITORY_URL}" ]]; then
+    -   docker tag "${CI_PROJECT_NAME}:build" "${GITLAB_REPOSITORY_URL}/${IMAGE_RELEASE_NAME}:${IMAGE_RELEASE_TAG}"
+    -   docker push "${GITLAB_REPOSITORY_URL}/${IMAGE_RELEASE_NAME}:${IMAGE_RELEASE_TAG}"
+    - fi
+    - if [[ ! -z "${DOCKERHUB_REGISTRY_ORGANISATION}" ]] && [[ ! -z "${DOCKERHUB_REGISTRY_USER}" ]] && [[ ! -z "${DOCKERHUB_REGISTRY_PASSWORD}" ]]; then
+    -   docker tag "${CI_PROJECT_NAME}:build" "${DOCKERHUB_REGISTRY_ORGANISATION}/${IMAGE_RELEASE_NAME}:${IMAGE_RELEASE_TAG}"
+    -   docker push "docker.io/${DOCKERHUB_REGISTRY_ORGANISATION}/${IMAGE_RELEASE_NAME}:${IMAGE_RELEASE_TAG}"
+    - fi
+
+##############################
+# test final image
+##############################
+test:
+  stage: test
+  tags:
+    - kubernetes-runner
+  services:
+    - name: docker:dind
+      command: ["dockerd", "--host=tcp://0.0.0.0:2375"]
+  before_script:
+    - *before_script_defaults
+    - docker load -i build/${CI_PROJECT_NAME}.tar
+  dependencies:
+    - build
+  script:
+    - docker run --rm ${CI_PROJECT_NAME}:build shellcheck --version
